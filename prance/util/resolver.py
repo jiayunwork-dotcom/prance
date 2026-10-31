@@ -55,6 +55,7 @@ __license__ = "MIT"
 __all__ = ()
 
 import copy
+import re
 
 import prance.util.url as _url
 
@@ -98,6 +99,28 @@ TRANSLATE_DEFAULT = 1
 
 #: Default, resole all references.
 RESOLVE_ALL = RESOLVE_INTERNAL | RESOLVE_HTTP | RESOLVE_FILES
+
+
+# -- OpenAPI 3.1 Reference Object sibling overrides -------------------
+#
+# Since OpenAPI 3.1 a Reference Object may carry ``summary`` and
+# ``description`` next to ``$ref``; these override the referenced
+# component's own fields when the referenced object type defines them.
+# The keys are the ``components`` collection names a ``$ref`` pointer can
+# target, the values are the sibling field names applicable to objects in
+# that collection under OpenAPI 3.1.  ``responses`` gains ``summary``
+# starting with OpenAPI 3.2.  Note that Schema Objects containing ``$ref``
+# are *not* Reference Objects and are intentionally absent here.
+_OPENAPI_VERSION_RE = re.compile(r"^\s*(\d+)\.(\d+)")
+
+_REF_SIBLING_FIELDS: dict[str, tuple[str, ...]] = {
+    "parameters": ("description",),
+    "requestBodies": ("description",),
+    "responses": ("description",),
+    "headers": ("description",),
+    "links": ("description",),
+    "examples": ("summary", "description"),
+}
 
 
 class _KeepRef:
@@ -201,6 +224,10 @@ class RefResolver:
         self.__encoding = options.get("encoding", None)
         self.__strict = options.get("strict", True)
 
+        # Reference Object sibling (summary/description) overrides are an
+        # OpenAPI 3.1 feature; the mapping is empty for older specs.
+        self.__ref_sibling_fields = self._detect_ref_sibling_fields(specs)
+
         if self.url:
             self.parsed_url = _url.absurl(self.url)
             self._url_key = (_url.urlresource(self.parsed_url), self.__strict)
@@ -268,10 +295,11 @@ class RefResolver:
         """Walk the spec iteratively, building the full reference topology.
 
         Returns:
-            sites: list of (path_in_spec, ref_key, ref_url, base_url)
+            sites: list of (path_in_spec, ref_key, ref_url, base_url, overrides)
                    for every $ref site in the top-level spec.
             targets: dict of ref_key -> raw (unresolved) value
-            edges: dict of ref_key -> list of (item_path, dep_ref_key, dep_url)
+            edges: dict of ref_key -> list of
+                   (item_path, dep_ref_key, dep_url, overrides)
                    within that target's raw value
             back_edges: set of (from_key, dep_key) pairs that form cycles
         """
@@ -292,7 +320,9 @@ class RefResolver:
                 continue
 
             ref_key: _RefKey = (_url.urlresource(ref_url), tuple(obj_path))
-            sites.append((item_path, ref_key, ref_url, base_url))
+            container = self._container_at(spec, item_path)
+            overrides = self._site_overrides(container, tuple(obj_path))
+            sites.append((item_path, ref_key, ref_url, base_url, overrides))
 
             if ref_key not in visited:
                 queue.append((ref_url, ref_key))
@@ -314,7 +344,9 @@ class RefResolver:
                     continue
 
                 dep_key: _RefKey = (_url.urlresource(dep_url), tuple(dep_path))
-                target_edges.append((item_path, dep_key, dep_url))
+                container = self._container_at(raw, item_path)
+                overrides = self._site_overrides(container, tuple(dep_path))
+                target_edges.append((item_path, dep_key, dep_url, overrides))
 
                 if dep_key not in visited:
                     queue.append((dep_url, dep_key))
@@ -346,7 +378,7 @@ class RefResolver:
                 node_edges = edges.get(node, [])
                 if idx < len(node_edges):
                     stack[-1] = (node, idx + 1)
-                    _, dep_key, _ = node_edges[idx]
+                    _, dep_key, _, _ = node_edges[idx]
                     if dep_key not in color:
                         continue
                     if color[dep_key] == WHITE:
@@ -375,7 +407,7 @@ class RefResolver:
         forward_deps: dict[_RefKey, list[_RefKey]] = {}
         for rk in ref_keys:
             deps = []
-            for _path, dep_key, _url_obj in edges.get(rk, []):
+            for _path, dep_key, _url_obj, _overrides in edges.get(rk, []):
                 if (rk, dep_key) not in back_edge_set:
                     deps.append(dep_key)
             forward_deps[rk] = deps
@@ -392,13 +424,15 @@ class RefResolver:
             forward_changes: dict[tuple, object] = {}
             recursive_sites: list[tuple] = []
 
-            for item_path, dep_key, dep_url in target_edges:
+            for item_path, dep_key, dep_url, overrides in target_edges:
                 is_back = (rk, dep_key) in back_edge_set
 
                 if is_back:
-                    recursive_sites.append((item_path, dep_key, dep_url))
+                    recursive_sites.append((item_path, dep_key, dep_url, overrides))
                 elif dep_key in resolved:
-                    value = self._translate_value(dep_key, dep_url, resolved[dep_key])
+                    value = self._translate_value(
+                        dep_key, dep_url, resolved[dep_key], overrides
+                    )
                     forward_changes[item_path] = value
 
             # Apply forward substitutions
@@ -419,11 +453,11 @@ class RefResolver:
         in the cycle, build the value from the innermost level outward.
         """
         # Collect all distinct recursive target keys from the sites
-        rec_dep_keys = {dep_key for _, dep_key, _ in recursive_sites}
+        rec_dep_keys = {dep_key for _, dep_key, _, _ in recursive_sites}
 
         for dep_key in rec_dep_keys:
             dep_sites = [
-                (ip, dk, du) for ip, dk, du in recursive_sites if dk == dep_key
+                (ip, dk, du, ov) for ip, dk, du, ov in recursive_sites if dk == dep_key
             ]
 
             # Build the recursion chain for this specific dependency
@@ -434,8 +468,8 @@ class RefResolver:
 
             # Now substitute the chain into raw
             changes: dict[tuple, object] = {}
-            for item_path, _dk, dep_url in dep_sites:
-                value = self._translate_value(dep_key, dep_url, chain)
+            for item_path, _dk, dep_url, overrides in dep_sites:
+                value = self._translate_value(dep_key, dep_url, chain, overrides)
                 changes[item_path] = value
             raw = self._apply_changes(raw, changes)
 
@@ -474,7 +508,9 @@ class RefResolver:
                 continue
             rk2: _RefKey = (_url.urlresource(ref_url_parsed), tuple(obj_path))
             if rk2 == dep_key:
-                dep_raw_rec_sites.append((item_path, rk2, ref_url_parsed))
+                container = self._container_at(dep_raw, item_path)
+                overrides = self._site_overrides(container, tuple(obj_path))
+                dep_raw_rec_sites.append((item_path, rk2, ref_url_parsed, overrides))
 
         # Also find forward (non-recursive) edges in dep_raw
         dep_raw_fwd: list[tuple] = []
@@ -484,7 +520,9 @@ class RefResolver:
                 continue
             rk2 = (_url.urlresource(ref_url_parsed), tuple(obj_path))
             if rk2 != dep_key and rk2 in resolved:
-                dep_raw_fwd.append((item_path, rk2, ref_url_parsed))
+                container = self._container_at(dep_raw, item_path)
+                overrides = self._site_overrides(container, tuple(obj_path))
+                dep_raw_fwd.append((item_path, rk2, ref_url_parsed, overrides))
 
         # Build inside-out: level 0 is the handler value, then wrap.
         # reclimit=1 means one encounter allowed before the handler fires,
@@ -495,16 +533,18 @@ class RefResolver:
 
             # Apply forward deps into this layer
             fwd_changes: dict[tuple, object] = {}
-            for item_path, fwd_key, fwd_url in dep_raw_fwd:
+            for item_path, fwd_key, fwd_url, overrides in dep_raw_fwd:
                 fwd_changes[item_path] = self._translate_value(
-                    fwd_key, fwd_url, resolved[fwd_key]
+                    fwd_key, fwd_url, resolved[fwd_key], overrides
                 )
             layer = self._apply_changes(layer, fwd_changes)
 
             # Substitute current (the inner level) into the recursive sites
             rec_changes: dict[tuple, object] = {}
-            for item_path, _rk2, rec_url in dep_raw_rec_sites:
-                rec_changes[item_path] = current
+            for item_path, _rk2, rec_url, overrides in dep_raw_rec_sites:
+                rec_changes[item_path] = self._translate_value(
+                    dep_key, rec_url, current, overrides
+                )
             layer = self._apply_changes(layer, rec_changes)
 
             current = layer
@@ -515,8 +555,12 @@ class RefResolver:
     # Helpers
     # ------------------------------------------------------------------
 
-    def _translate_value(self, ref_key, ref_url, resolved_value):
-        """Wrap resolved_value for TRANSLATE_EXTERNAL if needed."""
+    def _translate_value(self, ref_key, ref_url, resolved_value, overrides=None):
+        """Wrap resolved_value for TRANSLATE_EXTERNAL if needed.
+
+        Otherwise apply the Reference Object sibling overrides (OpenAPI
+        3.1 ``summary``/``description``) at this individual reference site.
+        """
         translate = (self.__resolve_method == TRANSLATE_EXTERNAL) and (
             self.parsed_url.path != ref_url.path
         )
@@ -525,7 +569,108 @@ class RefResolver:
                 ref_url, list(ref_key[1]), resolved_value
             )
             return {"$ref": "#/components/schemas/" + dref_url}
-        return resolved_value
+        return self._apply_overrides(resolved_value, overrides)
+
+    @staticmethod
+    def _detect_ref_sibling_fields(specs):
+        """Return the per-collection overridable sibling fields.
+
+        Returns an empty mapping for Swagger 2.0 / OpenAPI 3.0 documents
+        and unversioned specs, preserving the pre-3.1 behaviour of
+        ignoring every key next to ``$ref``.
+        """
+        if not isinstance(specs, dict):
+            return {}
+
+        version = specs.get("openapi")
+        if not isinstance(version, str):
+            return {}
+
+        match = _OPENAPI_VERSION_RE.match(version)
+        if match is None:
+            return {}
+
+        major, minor = int(match.group(1)), int(match.group(2))
+        if (major, minor) < (3, 1):
+            return {}
+
+        fields = {
+            collection: set(field_names)
+            for collection, field_names in _REF_SIBLING_FIELDS.items()
+        }
+        # The Response Object gained a summary field in OpenAPI 3.2.
+        if (major, minor) >= (3, 2):
+            fields["responses"].add("summary")
+        return fields
+
+    @staticmethod
+    def _ref_collection(obj_path):
+        """Infer the components collection a ``$ref`` pointer targets.
+
+        Detection is anchored at ``components/<collection>`` so that
+        Schema Object ``$ref`` siblings (pointers into ``schemas``,
+        ``$defs`` or Swagger ``definitions``) are never mistaken for
+        Reference Object overrides.  A pointer that starts with one of
+        the known collections is also accepted, which covers component
+        maps living at the root of a standalone referenced file.
+        """
+        for i in range(len(obj_path) - 1):
+            if obj_path[i] == "components" and obj_path[i + 1] in _REF_SIBLING_FIELDS:
+                return obj_path[i + 1]
+        if len(obj_path) >= 2 and obj_path[0] in _REF_SIBLING_FIELDS:
+            return obj_path[0]
+        return None
+
+    def _site_overrides(self, container, obj_path):
+        """Collect applicable sibling fields from one Reference Object.
+
+        Only ``summary``/``description`` keys that are actually valid for
+        the referenced object type are returned; siblings unsupported by
+        the target type are silently ignored (per the OpenAPI spec).
+        """
+        fields = self.__ref_sibling_fields
+        if not fields or not isinstance(container, dict):
+            return {}
+
+        collection = self._ref_collection(obj_path)
+        if collection is None:
+            return {}
+
+        allowed = fields[collection]
+        overrides = {}
+        for field_name in ("summary", "description"):
+            if field_name in allowed and field_name in container:
+                overrides[field_name] = container[field_name]
+        return overrides
+
+    @staticmethod
+    def _container_at(root, item_path):
+        """Return the dict containing the ``$ref`` key at *item_path*."""
+        if len(item_path) == 0:
+            return root
+
+        from prance.util.path import path_get
+
+        try:
+            return path_get(root, list(item_path))
+        except (KeyError, IndexError, TypeError):
+            return None
+
+    @staticmethod
+    def _apply_overrides(value, overrides):
+        """Return *value* with Reference Object siblings applied.
+
+        A shallow copy is made for sites that actually override a field,
+        so the shared resolved target is never mutated and other sites
+        referencing the same target keep its original values.  Sites
+        without overrides receive the shared object itself, preserving
+        structural sharing.
+        """
+        if not overrides or not isinstance(value, dict):
+            return value
+        merged = value.copy()
+        merged.update(overrides)
+        return merged
 
     def _apply_changes(self, partial, changes):
         """Apply a dict of {path: value} substitutions, shortest-path-first."""
@@ -543,9 +688,11 @@ class RefResolver:
     def _apply_to_spec(self, sites, resolved):
         """Apply all resolved values into self.specs (single pass)."""
         changes: dict[tuple, object] = {}
-        for item_path, ref_key, ref_url, base_url in sites:
+        for item_path, ref_key, ref_url, base_url, overrides in sites:
             if ref_key in resolved:
-                value = self._translate_value(ref_key, ref_url, resolved[ref_key])
+                value = self._translate_value(
+                    ref_key, ref_url, resolved[ref_key], overrides
+                )
                 changes[item_path] = value
         self.specs = self._apply_changes(self.specs, changes)
 

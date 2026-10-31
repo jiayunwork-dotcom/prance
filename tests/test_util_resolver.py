@@ -782,3 +782,273 @@ def test_permissive_object_on_recursion():
     assert inner_parent["type"] == "object"
     assert inner_parent["additionalProperties"] is True
     assert "x-recursive-ref" in inner_parent
+
+
+# ---------------------------------------------------------------------------
+# OpenAPI 3.1 Reference Object sibling summary/description overrides
+# ---------------------------------------------------------------------------
+
+_REF_SIBLINGS_SPEC = """\
+openapi: "{version}"
+info:
+  title: Reference sibling overrides
+  version: "1.0.0"
+paths:
+  /items:
+    get:
+      operationId: getItems
+      parameters:
+        - $ref: "#/components/parameters/IdParam"
+          description: per-site parameter description
+        - $ref: "#/components/parameters/IdParam"
+        - $ref: "#/components/parameters/IdParam"
+          description: another per-site parameter description
+          summary: parameter summary is not a thing yet
+      responses:
+        "200":
+          $ref: "#/components/responses/Ok"
+          description: per-site response description
+          summary: response summary does not exist in 3.1
+    post:
+      operationId: createItem
+      requestBody:
+        $ref: "#/components/requestBodies/Body"
+        description: per-site request body description
+      responses:
+        "200":
+          description: direct response
+          headers:
+            X-Rate:
+              $ref: "#/components/headers/Rate"
+              description: per-site header description
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Item"
+              examples:
+                first:
+                  $ref: "#/components/examples/Sample"
+                  summary: per-site example summary
+                  description: per-site example description
+          links:
+            related:
+              $ref: "#/components/links/Related"
+              description: per-site link description
+              summary: link summary does not exist in 3.1
+components:
+  parameters:
+    IdParam:
+      name: id
+      in: path
+      required: true
+      description: shared parameter description
+      schema:
+        type: string
+  requestBodies:
+    Body:
+      required: true
+      description: shared request body description
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Item"
+  responses:
+    Ok:
+      description: shared response description
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Item"
+  headers:
+    Rate:
+      description: shared header description
+      schema:
+        type: integer
+  links:
+    Related:
+      operationId: getItems
+      description: shared link description
+  examples:
+    Sample:
+      summary: shared example summary
+      description: shared example description
+      value:
+        id: "7"
+  schemas:
+    Item:
+      type: object
+      description: shared schema description
+      properties:
+        id:
+          type: string
+    ItemRefWithSiblings:
+      $ref: "#/components/schemas/Item"
+      description: schema sibling must be ignored
+    PlainItemRef:
+      $ref: "#/components/schemas/Item"
+"""
+
+
+def _resolve_inline_ref_siblings(version, spec_string=_REF_SIBLINGS_SPEC):
+    from prance.util import formats
+
+    spec_string = spec_string.format(version=version)
+    specs = formats.parse_spec(spec_string, "ref_siblings_inline.yaml")
+    res = resolver.RefResolver(
+        specs, fs.abspath("tests/specs/ref_siblings_inline.yaml")
+    )
+    res.resolve_references()
+    return res.specs
+
+
+def test_openapi31_ref_siblings_override_on_each_object_type():
+    specs = _resolve_inline_ref_siblings("3.1.0")
+    get_op = specs["paths"]["/items"]["get"]
+    post_op = specs["paths"]["/items"]["post"]
+
+    params = get_op["parameters"]
+    assert params[0]["description"] == "per-site parameter description"
+    assert params[0]["name"] == "id"
+    assert "summary" not in params[0]
+    assert params[2]["description"] == "another per-site parameter description"
+    assert "summary" not in params[2]
+
+    response = get_op["responses"]["200"]
+    assert response["description"] == "per-site response description"
+    assert "summary" not in response
+
+    body = post_op["requestBody"]
+    assert body["description"] == "per-site request body description"
+    assert "application/json" in body["content"]
+
+    header = post_op["responses"]["200"]["headers"]["X-Rate"]
+    assert header["description"] == "per-site header description"
+
+    link = post_op["responses"]["200"]["links"]["related"]
+    assert link["description"] == "per-site link description"
+    assert "summary" not in link
+
+    example = post_op["responses"]["200"]["content"]["application/json"]["examples"][
+        "first"
+    ]
+    assert example["summary"] == "per-site example summary"
+    assert example["description"] == "per-site example description"
+    assert example["value"] == {"id": "7"}
+
+
+def test_openapi31_ref_siblings_do_not_affect_sites_without_them():
+    specs = _resolve_inline_ref_siblings("3.1.0")
+    params = specs["paths"]["/items"]["get"]["parameters"]
+
+    # The site without siblings keeps the referenced component's value.
+    assert params[1]["description"] == "shared parameter description"
+
+    # And the shared component definition itself is untouched.
+    assert (
+        specs["components"]["parameters"]["IdParam"]["description"]
+        == "shared parameter description"
+    )
+    assert (
+        specs["components"]["responses"]["Ok"]["description"]
+        == "shared response description"
+    )
+
+
+def test_openapi31_ref_siblings_isolate_sites_from_each_other():
+    specs = _resolve_inline_ref_siblings("3.1.0")
+    params = specs["paths"]["/items"]["get"]["parameters"]
+
+    # Override sites get private copies; sites without siblings keep on
+    # sharing the single resolved target object.
+    assert params[0] is not params[1]
+    assert params[0] is not params[2]
+    assert params[1] is not params[2]
+
+    # Mutating one override site must not leak into the other sites.
+    params[0]["description"] = "locally mutated"
+    assert params[1]["description"] == "shared parameter description"
+    assert params[2]["description"] == "another per-site parameter description"
+
+
+def test_openapi30_ref_siblings_are_ignored():
+    specs = _resolve_inline_ref_siblings("3.0.3")
+    params = specs["paths"]["/items"]["get"]["parameters"]
+
+    # In 3.0 a Reference Object only carries $ref: siblings are dropped
+    # and the component's own value survives unchanged.
+    assert params[0]["description"] == "shared parameter description"
+    assert params[1]["description"] == "shared parameter description"
+    assert params[2]["description"] == "shared parameter description"
+
+    response = specs["paths"]["/items"]["get"]["responses"]["200"]
+    assert response["description"] == "shared response description"
+    assert "summary" not in response
+
+
+def test_openapi32_ref_sibling_response_summary_takes_effect():
+    specs = _resolve_inline_ref_siblings("3.2.0")
+    response = specs["paths"]["/items"]["get"]["responses"]["200"]
+
+    # Response gained a summary field in 3.2, so the sibling now applies.
+    assert response["summary"] == "response summary does not exist in 3.1"
+    assert response["description"] == "per-site response description"
+
+    # Types that still have no summary (parameter/link) keep ignoring it.
+    params = specs["paths"]["/items"]["get"]["parameters"]
+    assert "summary" not in params[0]
+    link = specs["paths"]["/items"]["post"]["responses"]["200"]["links"]["related"]
+    assert "summary" not in link
+
+
+def test_schema_ref_siblings_resolve_as_before():
+    specs = _resolve_inline_ref_siblings("3.1.0")
+    schemas = specs["components"]["schemas"]
+
+    # A Schema Object with $ref is not a Reference Object: siblings are
+    # dropped exactly like ordinary resolution, target fields survive.
+    with_siblings = schemas["ItemRefWithSiblings"]
+    plain = schemas["PlainItemRef"]
+    assert with_siblings["description"] == "shared schema description"
+    assert with_siblings["properties"]["id"]["type"] == "string"
+    assert plain is with_siblings
+
+
+_REF_SIBLINGS_EXTERNAL_SPEC = """\
+openapi: "3.1.0"
+info:
+  title: External reference sibling overrides
+  version: "1.0.0"
+paths:
+  /ext:
+    get:
+      operationId: ext
+      parameters:
+        - $ref: "ref_siblings_external.yaml#/components/parameters/ExtId"
+          description: local override of external parameter
+        - $ref: "ref_siblings_external.yaml#/components/parameters/ExtId"
+      responses:
+        "200":
+          $ref: "ref_siblings_external.yaml#/components/responses/ExtOk"
+          description: local override of external response
+"""
+
+
+def test_openapi31_ref_siblings_apply_to_external_files():
+    from prance.util import formats
+
+    specs = formats.parse_spec(
+        _REF_SIBLINGS_EXTERNAL_SPEC, "tests/specs/ref_siblings_inline.yaml"
+    )
+    res = resolver.RefResolver(
+        specs, fs.abspath("tests/specs/ref_siblings_inline.yaml")
+    )
+    res.resolve_references()
+
+    params = res.specs["paths"]["/ext"]["get"]["parameters"]
+    assert params[0]["description"] == "local override of external parameter"
+    assert params[0]["name"] == "id"
+    assert params[1]["description"] == "external shared parameter description"
+    assert params[0] is not params[1]
+
+    response = res.specs["paths"]["/ext"]["get"]["responses"]["200"]
+    assert response["description"] == "local override of external response"

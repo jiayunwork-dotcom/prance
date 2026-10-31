@@ -224,6 +224,65 @@ def test_issue_83_skip_propagation():
 
 
 @pytest.mark.skipif(none_of("openapi-spec-validator"), reason="Missing backends")
+def test_openapi31_reference_sibling_overrides():
+    # OpenAPI 3.1 Reference Objects may override the referenced
+    # component's summary/description; the resolved-and-validated spec
+    # must show the per-site values.
+    spec_string = """\
+openapi: "3.1.0"
+info:
+  title: Reference sibling overrides
+  version: "1.0.0"
+paths:
+  /items:
+    get:
+      operationId: listItems
+      parameters:
+        - $ref: "#/components/parameters/IdParam"
+          description: per-site parameter description
+      responses:
+        "200":
+          $ref: "#/components/responses/Ok"
+          description: per-site response description
+components:
+  parameters:
+    IdParam:
+      name: id
+      in: query
+      description: shared parameter description
+      schema:
+        type: string
+  responses:
+    Ok:
+      description: shared response description
+      content:
+        application/json:
+          schema:
+            type: string
+"""
+    parser = ResolvingParser(spec_string=spec_string, backend="openapi-spec-validator")
+    assert parser.valid
+
+    operation = parser.specification["paths"]["/items"]["get"]
+    parameter = operation["parameters"][0]
+    assert parameter["description"] == "per-site parameter description"
+    assert parameter["name"] == "id"
+    assert operation["responses"]["200"]["description"] == (
+        "per-site response description"
+    )
+
+    # The shared component definitions keep their own values.
+    assert (
+        parser.specification["components"]["parameters"]["IdParam"]["description"]
+        == "shared parameter description"
+    )
+    assert (
+        parser.specification["components"]["responses"]["Ok"]["description"]
+        == "shared response description"
+    )
+
+
+@pytest.mark.skipif(none_of("openapi-spec-validator"), reason="Missing backends")
 def test_value_not_converted_to_boolean():
     specs = """openapi: "3.0.0"
 info:

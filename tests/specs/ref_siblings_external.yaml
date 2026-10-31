@@ -1,0 +1,17 @@
+# Shared components referenced from another document via file $refs.
+# Used by the OpenAPI 3.1 Reference Object sibling override tests.
+components:
+  parameters:
+    ExtId:
+      name: id
+      in: query
+      description: external shared parameter description
+      schema:
+        type: string
+  responses:
+    ExtOk:
+      description: external shared response description
+      content:
+        application/json:
+          schema:
+            type: string

@@ -1,0 +1,9 @@
+When resolving OpenAPI 3.1 (and later) documents, ``summary`` and
+``description`` siblings of a ``$ref`` now override the referenced
+component's own fields on parameters, request bodies, responses,
+headers, links and examples, as mandated by the OpenAPI Specification.
+Siblings unsupported by the referenced object type (e.g. ``summary``
+next to an OpenAPI 3.1 response reference) are silently ignored, while
+OpenAPI 3.0 documents and Schema Objects containing ``$ref`` keep their
+previous behaviour. Overrides apply per reference site without mutating
+the shared referenced component and also work across file boundaries.
